@@ -47,6 +47,7 @@ import { CodeDiffPanel } from '@/containers/CodeDiffPanel'
 import { CodeTodoPanel } from '@/containers/CodeTodoPanel'
 import { CodePreviewPanel } from '@/containers/CodePreviewPanel'
 import { CodeArtifactCard } from '@/containers/CodeArtifactCard'
+import { ensureCodeModelStarted } from '@/lib/codeModelStartup'
 import { artifactsFromParts } from '@/lib/codeArtifacts'
 import { codeTurnsToUIMessages } from '@/lib/codeTurns'
 import { collectCodeFileDiffs } from '@/lib/codeDiffs'
@@ -656,12 +657,10 @@ function CodePage() {
     // rather than mid-load — cleared in `finally`.
     if (selectedProvider === 'llamacpp') {
       run.setLlamacppRun(sid, selectedModel.id)
-    }
 
-    // Local models load before the first token — but only on a cold start.
-    // Probe the router (as the chat transport does) so the load card shows only
-    // when the model isn't already loaded, not on every warm run.
-    if (selectedProvider === 'llamacpp') {
+      // Local models load before the first token — but only on a cold start.
+      // Probe the router (as the chat transport does) so the load card shows
+      // only when the model isn't already loaded, not on every warm run.
       try {
         const loaded = await invoke<string[]>('plugin:llamacpp|get_loaded_models')
         if (!loaded.includes(selectedModel.id)) {
@@ -807,6 +806,11 @@ function CodePage() {
     onEvent.onmessage = handleEvent
 
     try {
+      if (selectedProvider === 'llamacpp' || selectedProvider === 'mlx') {
+        const provider = providers.find((p) => p.provider === selectedProvider)
+        await ensureCodeModelStarted(serviceHub.models(), provider, selectedModel.id)
+      }
+
       await invoke('agent_run', {
         runId,
         onEvent,
