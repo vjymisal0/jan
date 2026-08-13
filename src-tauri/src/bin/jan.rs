@@ -10,6 +10,7 @@ use console::Style;
 // Import the library crate so we can access core modules.
 // The lib target is named "app_lib" (see [lib] section in Cargo.toml).
 use app_lib::core::cli::providers::{load_provider_configs, ProviderOverrides};
+use app_lib::core::cli::run_report::OutputFormat;
 use app_lib::core::cli::{
     cli_agent_config_list, cli_agent_config_path, cli_agent_config_set, cli_agent_config_unset,
     cli_agent_run, cli_agent_status, cli_agent_step, cli_agent_ui, cli_delete_thread,
@@ -51,9 +52,6 @@ struct Cli {
     /// Model ID overriding [agent].model in agent.toml (bare TUI only)
     #[arg(long)]
     model: Option<String>,
-    /// Max turns per message, clamped 1..=400 (bare TUI only)
-    #[arg(long)]
-    max_turns: Option<u32>,
     /// Image file to attach to the first message, repeatable (bare TUI only)
     #[arg(long = "image")]
     images: Vec<String>,
@@ -194,7 +192,7 @@ impl ProviderArgs {
 
 #[derive(Subcommand)]
 enum AgentCommands {
-    /// Run the agent loop to completion or the turn/token budget
+    /// Run the agent loop to completion or the session token budget
     Run {
         /// Project root containing .jan/agent/agent.toml
         #[arg(long, default_value = ".")]
@@ -204,9 +202,6 @@ enum AgentCommands {
         /// Model ID (overrides [agent].model in agent.toml)
         #[arg(long)]
         model: Option<String>,
-        /// Max turns (overrides [agent].max_turns; clamped 1..=400)
-        #[arg(long)]
-        max_turns: Option<u32>,
         /// Prompt for approval before writes, shell commands, and MCP tool calls
         #[arg(long)]
         safe: bool,
@@ -214,6 +209,10 @@ enum AgentCommands {
         providers: ProviderArgs,
         #[command(flatten)]
         resume: ResumeRunArgs,
+        /// `text` streams the answer as it arrives; `json` prints one result
+        /// object on stdout when the run finishes
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        output_format: OutputFormat,
     },
     /// Run a single turn (debugging)
     Step {
@@ -318,32 +317,11 @@ enum ModelsCommands {
 
 /// Build a left-aligned, bright-yellow ASCII logo for the help header.
 fn make_logo() -> String {
-    // "JAN" in ANSI Shadow block letters
-    let lines = [
-        r"     ██╗ █████╗ ███╗  ██╗",
-        r"     ██║██╔══██╗████╗ ██║",
-        r"     ██║███████║██╔██╗██║",
-        r"██   ██║██╔══██║██║╚████║",
-        r"╚█████╔╝██║  ██║██║ ╚███║",
-        r" ╚════╝ ╚═╝  ╚═╝╚═╝  ╚══╝",
-    ];
-
-    // Fixed left-aligned indent (2 spaces)
-    let indent = "  ";
-
     let yellow = Style::new().yellow().bold();
-
-    let mut out: Vec<String> = Vec::new();
-
-    // Add padding at top
-    out.push(String::new());
-    out.push(String::new());
-
-    // Logo lines
-    for l in &lines {
-        out.push(format!("{}{}", indent, yellow.apply_to(l)));
+    let mut out = vec![String::new(), String::new()];
+    for l in app_lib::core::cli::brand::LOGO {
+        out.push(format!("  {}", yellow.apply_to(l)));
     }
-
     out.join("\n")
 }
 
@@ -385,7 +363,6 @@ async fn main() {
             &cli.project,
             cli.task,
             cli.model,
-            cli.max_turns,
             cli.images,
             overrides,
             !cli.safe,
@@ -474,19 +451,19 @@ async fn handle_agent(cmd: AgentCommands) {
             project,
             task,
             model,
-            max_turns,
             safe,
             providers,
             resume,
+            output_format,
         } => {
             cli_agent_run(
                 &project,
                 &task,
                 model,
-                max_turns,
                 providers.into_overrides(),
                 !safe,
                 resume.into_target(),
+                output_format,
             )
             .await
         }
@@ -651,6 +628,44 @@ mod tests {
     fn safe_flag_parses_and_defaults_off() {
         assert!(!Cli::parse_from(["jan"]).safe);
         assert!(Cli::parse_from(["jan", "--safe"]).safe);
+    }
+
+    /// Parse `jan cli agent run <task> <extra...>` and pull out its output format.
+    fn parsed_output_format(extra: &[&str]) -> OutputFormat {
+        let mut argv = vec!["jan", "cli", "agent", "run", "task"];
+        argv.extend_from_slice(extra);
+        match Cli::parse_from(argv).command {
+            Some(Commands::Cli {
+                cmd:
+                    CliCommands::Agent {
+                        cmd: AgentCommands::Run { output_format, .. },
+                    },
+            }) => output_format,
+            _ => panic!("expected `cli agent run`"),
+        }
+    }
+
+    #[test]
+    fn output_format_parses_and_defaults_to_text() {
+        assert_eq!(parsed_output_format(&[]), OutputFormat::Text);
+        assert_eq!(
+            parsed_output_format(&["--output-format", "json"]),
+            OutputFormat::Json
+        );
+        assert_eq!(
+            parsed_output_format(&["--output-format=text"]),
+            OutputFormat::Text
+        );
+        assert!(Cli::try_parse_from([
+            "jan",
+            "cli",
+            "agent",
+            "run",
+            "task",
+            "--output-format",
+            "yaml"
+        ])
+        .is_err());
     }
 
     #[test]

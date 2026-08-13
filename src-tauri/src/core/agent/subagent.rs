@@ -1593,6 +1593,7 @@ mod tests {
             subagents_enabled: true,
             max_parallel_subagents: 1,
             auto_approve: false,
+            background_subagents: None,
             run_mode: crate::core::agent::plan::RunMode::Normal,
         }
     }

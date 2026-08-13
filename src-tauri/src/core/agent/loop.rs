@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::core::agent::events::{StreamEvent, Usage};
 use crate::core::agent::session::SessionBudget;
-use tauri_plugin_agent_tools::tools::gate::PermissionDecision;
+use tauri_plugin_agent_tools::tools::gate::{DenyReason, PermissionDecision};
 use crate::core::agent::upstream::{
     collect_mcp_openai_tools, copy_optional_chat_params, execute_mcp_tool_calls,
     extract_choice_message, extract_tool_calls, load_assistant_config, parse_openai_messages,
@@ -461,9 +461,7 @@ impl CompositeToolInvoker {
         }
         match receiver.await {
             Ok(Ok(results)) => match request.validate_results(&results) {
-                Ok(()) => serde_json::to_string(&results).unwrap_or_else(|error| {
-                    format!("ERROR: could not encode ask response: {error}")
-                }),
+                Ok(()) => request.render_results(&results),
                 Err(error) => format!("ERROR: invalid ask response: {error}"),
             },
             Ok(Err(AskError::Cancelled)) | Err(_) => {
@@ -572,6 +570,25 @@ fn denied_by_policy_msg(name: &str, project_root: &std::path::Path) -> String {
         "ERROR: tool '{name}' denied by project policy (see [tools] deny in {})",
         crate::core::agent::project::agent_toml_path(project_root).display()
     )
+}
+
+/// Message for a call that reached the hidden agent state directory. Says the
+/// path does not exist *for the agent* and that retrying is pointless: pointing
+/// at a deny list would send the model reading a file that is hidden too.
+fn hidden_path_msg(name: &str) -> String {
+    format!(
+        "ERROR: tool '{name}' refused: '{}' is the agent's own state directory and is not part of \
+         the project. It is hidden from every tool -- do not try to reach it another way. Skills \
+         and memory are available through the skill_*/memory_* tools.",
+        tauri_plugin_agent_tools::tools::sandbox::JAN_DIR
+    )
+}
+
+fn hard_deny_msg(name: &str, reason: DenyReason, project_root: &std::path::Path) -> String {
+    match reason {
+        DenyReason::Policy => denied_by_policy_msg(name, project_root),
+        DenyReason::Hidden => hidden_path_msg(name),
+    }
 }
 
 /// Rejection message for a mutation-capable tool call attempted in
@@ -722,8 +739,8 @@ impl ToolInvoker for CompositeToolInvoker {
                 &snapshot,
             );
             // Auto-approval suppresses every prompt (sandbox escape, write, exec) but
-            // still honors HardDeny, so the `.jan/agent` restricted-path invariant
-            // and explicit agent.toml denies hold.
+            // still honors HardDeny, so the hidden `.jan` invariant and explicit
+            // agent.toml denies hold.
             let decision = match decision {
                 Decision::Prompt(_) if self.auto_approve => Decision::Allow,
                 other => other,
@@ -755,7 +772,9 @@ impl ToolInvoker for CompositeToolInvoker {
             }
             let (text, diff) = match decision {
                 Decision::Allow => execute_builtin_with_diff(tool, &args, &self.tool_context()).await,
-                Decision::HardDeny => (denied_by_policy_msg(name, &self.project_root), None),
+                Decision::HardDeny(reason) => {
+                    (hard_deny_msg(name, reason, &self.project_root), None)
+                }
                 Decision::Prompt(kind) => {
                     let request_id = next_permission_id();
                     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -853,6 +872,10 @@ impl ToolInvoker for CompositeToolInvoker {
 /// API-server entry point. Preserves the original single-final-JSON contract by
 /// running the streamed loop with a discarded event sink. Desktop-only: the
 /// `cli` build has no proxy server.
+///
+/// An HTTP client has no way to cancel mid-run, so this is the one path that
+/// keeps a turn cap: a body that doesn't ask for one gets
+/// [`PROXY_DEFAULT_MAX_TURNS`] rather than the unbounded default.
 #[cfg(not(feature = "cli"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_server_side_openai_orchestration(
@@ -886,8 +909,26 @@ pub(crate) async fn run_server_side_openai_orchestration(
         background_subagents: None,
         run_mode: crate::core::agent::plan::RunMode::Normal,
     };
-    run_orchestration_streamed(&tx, json_body, &args).await
+    let body = match json_body.get("max_turns") {
+        Some(_) => std::borrow::Cow::Borrowed(json_body),
+        None => {
+            let mut b = json_body.clone();
+            if let Some(map) = b.as_object_mut() {
+                map.insert(
+                    "max_turns".to_string(),
+                    serde_json::json!(PROXY_DEFAULT_MAX_TURNS),
+                );
+            }
+            std::borrow::Cow::Owned(b)
+        }
+    };
+    run_orchestration_streamed(&tx, &body, &args).await
 }
+
+/// Turn cap applied to an API-server run whose body doesn't set one. Small on
+/// purpose: nothing on that path can interrupt a loop that never converges.
+#[cfg(not(feature = "cli"))]
+const PROXY_DEFAULT_MAX_TURNS: u64 = 8;
 
 /// Streaming entry point. Emits `Step`/`ToolCall`/`ToolResult` progress events
 /// and exactly one terminal `Done`/`Error` derived from the final result, while
@@ -1006,13 +1047,13 @@ fn build_run_system_prompt(
     }
 }
 
-/// System-prompt addendum on a session's first substantive message: without
-/// it, the model only ever reaches for `todo` once told explicitly that it
-/// has the tool, instead of proactively planning a multi-step request the
-/// way a plan laid out up front would help with. Paired with a forced
-/// `tool_choice` on that same first turn (see `should_suggest_eager_todo_plan`
+/// System-prompt addendum for a `/goal` run with no staged plan: an unattended
+/// loop that keeps firing turns until a condition is met needs the phased list
+/// up front, both to work through and for the user to read on return. Paired
+/// with a forced `tool_choice` on that turn (see `should_force_goal_todo_plan`
 /// and its caller), so this is a real requirement, not a suggestion the model
-/// can silently skip -- the imperative wording matches that guarantee.
+/// can silently skip -- the imperative wording matches that guarantee. Normal
+/// turns never get it: there the model decides when a list is worth keeping.
 const EAGER_TODO_PROMPT_ADDENDUM: &str = "Before substantial work on this request, create a \
 phased todo. You MUST call `todo` first in this turn with a single `init` op covering \
 investigation through implementation and verification, not just the next step. Keep each task \
@@ -1022,20 +1063,20 @@ top-level `phase`/`task` strings, which are for later ops (start/done/drop), not
 `todo` succeeds, continue the request in the same turn.";
 
 /// Upkeep half of the todo guidance, applied on every turn that has a non-empty
-/// list rather than only a session's first message. The init addendum above
-/// fires once and never again (see `should_suggest_eager_todo_plan`), so a
-/// resumed or multi-turn session would otherwise carry a list the model was
-/// never told to maintain -- which is exactly how a run ends reading 0/N with
-/// every task finished but still marked pending.
+/// list, in every mode -- including a list the model staged on its own. The
+/// init addendum above only ever fires under `/goal`, so a normal or resumed
+/// session would otherwise carry a list the model was never told to maintain --
+/// which is exactly how a run ends reading 0/N with every task finished but
+/// still marked pending.
 const TODO_UPKEEP_PROMPT_ADDENDUM: &str = "You have an active todo list. Keep it honest as you \
 work: the moment you finish a task call `todo` with `done` for it (or `drop` if you are skipping \
 it), before moving on to the next one. Do not leave finished work sitting as pending, and do not \
 batch the close-out to the end of the turn.";
 
-/// Which todo addendum this turn needs, if any: the init guidance on a
-/// session's first substantive message, otherwise the upkeep guidance whenever
-/// a list already exists. `None` when there is nothing to say (no list, and not
-/// a first-message candidate). Subagent/plan-mode gating is the caller's.
+/// Which todo addendum this turn needs, if any: the init guidance on a `/goal`
+/// turn with no plan staged, otherwise the upkeep guidance whenever a list
+/// already exists. `None` when there is nothing to say (no list, and not a
+/// goal run). Subagent/plan-mode gating is the caller's.
 async fn todo_prompt_addendum(
     eager_todo_plan: bool,
     todo_registry: &Option<crate::core::agent::todo::TodoRegistry>,
@@ -1050,41 +1091,22 @@ async fn todo_prompt_addendum(
     has_todos.then_some(TODO_UPKEEP_PROMPT_ADDENDUM)
 }
 
-/// True on a session's first substantive user message: exactly one user-role
-/// message in the conversation so far (this one), no todos staged yet, and
-/// the prompt looks like actual multi-step work rather than a greeting,
-/// acknowledgement, or a bare question/exclamation a phased plan would be
-/// overkill for.
-async fn should_suggest_eager_todo_plan(
-    conversation_messages: &[serde_json::Value],
+/// True when this turn should be forced to stage a plan: a `/goal` run whose
+/// list is still empty. Forcing is deliberately limited to goal mode -- an
+/// unattended loop needs a plan to work against, while an ordinary turn is the
+/// model's call, and a phased list for small work is noise the user reads past.
+/// Requires a registry: without one the `todo` tool is never advertised, so
+/// forcing `tool_choice` on it would name a tool the request does not carry.
+async fn should_force_goal_todo_plan(
+    goal_mode: bool,
     todo_registry: &Option<crate::core::agent::todo::TodoRegistry>,
 ) -> bool {
-    let user_turns = conversation_messages
-        .iter()
-        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-        .count();
-    if user_turns != 1 {
-        return false;
-    }
-    let Some(prompt_text) = latest_user_text(conversation_messages) else {
-        return false;
-    };
-    let trimmed = prompt_text.trim_end();
-    if ['?', '！', '？', '!'].iter().any(|c| trimmed.ends_with(*c)) {
-        return false;
-    }
-    // A greeting, thanks, or one-line aside ("hi", "ok thanks") is not work a
-    // phased plan helps with. Require enough words to look like an actual
-    // request; the shortest real task prompts ("fix the login bug") clear this,
-    // while chit-chat does not. A word-count floor, not a keyword blocklist, so
-    // it never has to enumerate every possible pleasantry.
-    const MIN_SUBSTANTIVE_WORDS: usize = 4;
-    if trimmed.split_whitespace().count() < MIN_SUBSTANTIVE_WORDS {
+    if !goal_mode {
         return false;
     }
     match todo_registry {
         Some(registry) => registry.lock().await.is_empty(),
-        None => true,
+        None => false,
     }
 }
 
@@ -1182,9 +1204,17 @@ async fn orchestrate_inner(
     // Child (subagent) runs are excluded via `system_prompt_override`, the
     // same gate the memory-recall block above uses to distinguish a
     // top-level run from a subagent's isolated context.
+    // `/goal` is a per-request flag like `run_mode`: the TUI sets it while a
+    // goal is active, and nothing else does, so every other surface (a plain
+    // turn, `jan cli agent run`, a subagent) leaves the model free to reach for
+    // `todo` on its own.
+    let goal_mode = json_body
+        .get("goal_mode")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let eager_todo_plan = run_mode != crate::core::agent::plan::RunMode::Plan
         && system_prompt_override.is_none()
-        && should_suggest_eager_todo_plan(&conversation_messages, todo_registry).await;
+        && should_force_goal_todo_plan(goal_mode, todo_registry).await;
     let system_prompt = if run_mode == crate::core::agent::plan::RunMode::Plan {
         let addendum = crate::core::agent::plan::plan_mode_prompt_addendum();
         Some(match system_prompt {
@@ -1353,13 +1383,7 @@ async fn orchestrate_inner(
     )
     .await?;
 
-    // Explicit values pass through unclamped; `0` means unbounded (guarded by
-    // the session token budget and cancellation). Absent falls back to 8 for
-    // the proxy path, which has no interactive cancel.
-    let max_turns = json_body
-        .get("max_turns")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(8) as usize;
+    let max_turns = body_turn_cap(json_body);
 
     let http_model = HttpModelInvoker {
         client: client.clone(),
@@ -1372,7 +1396,7 @@ async fn orchestrate_inner(
         mcp_settings: mcp_settings.clone(),
     };
 
-    let max_session_tokens = json_body.get("max_session_tokens").and_then(|v| v.as_u64());
+    let max_session_tokens = body_session_budget(json_body);
     let mut budget = SessionBudget::new(max_session_tokens);
 
     if let Some(root) = project_root {
@@ -1488,10 +1512,16 @@ fn build_completion_request(
         "messages".to_string(),
         serde_json::Value::Array(conversation_messages.to_vec()),
     );
-    let tool_choice = match forced_tool_choice {
-        Some(name) => serde_json::json!({ "type": "function", "function": { "name": name } }),
-        None => serde_json::json!("auto"),
-    };
+    let tool_choice = forced_tool_choice
+        .filter(|name| {
+            openai_tools
+                .iter()
+                .any(|tool| tool["function"]["name"].as_str() == Some(*name))
+        })
+        .map_or_else(
+            || serde_json::json!("auto"),
+            |name| serde_json::json!({ "type": "function", "function": { "name": name } }),
+        );
     completion_map.insert("tool_choice".to_string(), tool_choice);
     if !openai_tools.is_empty() {
         completion_map.insert(
@@ -1572,6 +1602,26 @@ async fn open_todo_summary(
     todo_registry?.lock().await.open_summary()
 }
 
+/// Turn cap for a request body. No cap by default: the agent runs as long as
+/// the task needs, guarded by the session token budget and cancellation.
+/// `max_turns` survives only for callers that have neither guard (`jan cli
+/// agent step`, the API-server proxy); `0` and absent both mean unbounded.
+fn body_turn_cap(json_body: &serde_json::Value) -> usize {
+    json_body
+        .get("max_turns")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize
+}
+
+/// Token-spend ceiling for a request body, the real bound on run length.
+/// `0` is the explicit "no ceiling" encoding, matching `max_turns`.
+fn body_session_budget(json_body: &serde_json::Value) -> Option<u64> {
+    json_body
+        .get("max_session_tokens")
+        .and_then(|v| v.as_u64())
+        .filter(|v| *v > 0)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_cycle(
     events: &mpsc::UnboundedSender<StreamEvent>,
@@ -1590,9 +1640,9 @@ async fn run_turn_cycle(
     // instead of an easily-ignored suggestion. `None` for every later turn.
     force_first_tool: Option<&str>,
 ) -> Result<serde_json::Value, String> {
-    // `max_turns == 0` means unbounded: the session token budget and user
-    // cancellation are the real guards, so an interactive run isn't cut off
-    // mid-task by a fixed turn cap.
+    // `max_turns == 0` is the normal case: the session token budget and user
+    // cancellation are the real guards, so a run isn't cut off mid-task by a
+    // fixed turn cap.
     let unlimited = max_turns == 0;
     let mut turn: usize = 0;
     // Mid-run todo upkeep: after a long uninterrupted run of mutating tool
@@ -1651,6 +1701,13 @@ async fn run_turn_cycle(
                             attempts + 1
                         );
                         conversation_messages = compacted;
+                        // Publish now, not at the end of the run: a retry that
+                        // never recovers returns Err, and an unpublished
+                        // compaction leaves the client holding the oversized
+                        // history that every later turn would re-overflow on.
+                        let _ = events.send(StreamEvent::MessagesUpdated {
+                            messages: conversation_messages.clone(),
+                        });
                         keep_recent = (keep_recent / 2).max(2);
                         attempts += 1;
                     }
@@ -1711,11 +1768,36 @@ async fn run_turn_cycle(
             return Ok(completion);
         }
 
+        // The session budget is exhausted. This is a soft stop, not an error:
+        // a subagent that inherits the parent's remaining budget must hand back
+        // its partial progress (as an assistant message) so the parent can act
+        // on it, instead of the run hard-failing and losing the work. Tool
+        // calls are not executed; nothing further is spent against the ceiling.
         if budget.exhausted() {
-            return Err(format!(
-                "session token budget exhausted ({} tokens) before resolving tool calls",
-                budget.spent()
-            ));
+            let partial = extract_choice_message(&completion)
+                .and_then(|m| m.get("content").and_then(|c| c.as_str()))
+                .unwrap_or("")
+                .to_string();
+            let stop_note = format!(
+                "[session token budget exhausted ({} tokens)] Partial progress so far:\n\
+                 {}",
+                budget.spent(),
+                if partial.is_empty() {
+                    "(none yet reported)".to_string()
+                } else {
+                    partial
+                }
+            );
+            conversation_messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": stop_note,
+            }));
+            let _ = events.send(StreamEvent::MessagesUpdated {
+                messages: conversation_messages.clone(),
+            });
+            return Ok(serde_json::json!({
+                "choices": [{ "message": { "content": stop_note }, "finish_reason": "stop" }]
+            }));
         }
 
         for tc in &tool_calls {
@@ -1885,7 +1967,7 @@ async fn run_turn_cycle(
     }
 
     Err(format!(
-        "reached the {max_turns}-turn limit while the model was still calling tools; raise --max-turns (or set 0 for unbounded) to let it finish"
+        "reached the {max_turns}-turn limit while the model was still calling tools"
     ))
 }
 
@@ -1952,10 +2034,6 @@ mod tests {
         }
     }
 
-    fn user_message(text: &str) -> serde_json::Value {
-        json!({ "role": "user", "content": text })
-    }
-
     fn empty_todo_registry() -> crate::core::agent::todo::TodoRegistry {
         std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::core::agent::todo::TodoList::default(),
@@ -1973,47 +2051,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eager_todo_plan_suggested_on_first_substantive_message() {
-        let convo = vec![user_message("build a flappy bird clone")];
-        assert!(should_suggest_eager_todo_plan(&convo, &Some(empty_todo_registry())).await);
-        assert!(should_suggest_eager_todo_plan(&convo, &None).await);
+    async fn goal_todo_plan_forced_while_a_goal_has_no_plan() {
+        assert!(should_force_goal_todo_plan(true, &Some(empty_todo_registry())).await);
     }
 
     #[tokio::test]
-    async fn eager_todo_plan_not_suggested_for_a_bare_question() {
-        let convo = vec![user_message("what's the capital of France?")];
-        assert!(!should_suggest_eager_todo_plan(&convo, &None).await);
-        let convo = vec![user_message("nice work!")];
-        assert!(!should_suggest_eager_todo_plan(&convo, &None).await);
+    async fn goal_todo_plan_not_forced_once_the_plan_is_staged() {
+        assert!(!should_force_goal_todo_plan(true, &Some(staged_todo_registry())).await);
     }
 
     #[tokio::test]
-    async fn eager_todo_plan_not_suggested_for_a_short_greeting() {
-        // Punctuation-free chit-chat must not force a todo plan: the word-count
-        // floor catches greetings and acks that the `?`/`!` check misses.
-        for msg in ["hi", "hello", "hey there", "ok thanks"] {
-            let convo = vec![user_message(msg)];
-            assert!(
-                !should_suggest_eager_todo_plan(&convo, &None).await,
-                "short greeting should not trigger eager todo: {msg:?}"
-            );
-        }
+    async fn goal_todo_plan_never_forced_outside_goal_mode() {
+        assert!(!should_force_goal_todo_plan(false, &Some(empty_todo_registry())).await);
     }
 
     #[tokio::test]
-    async fn eager_todo_plan_not_suggested_once_todos_exist() {
-        let convo = vec![user_message("keep going")];
-        assert!(!should_suggest_eager_todo_plan(&convo, &Some(staged_todo_registry())).await);
+    async fn goal_todo_plan_not_forced_without_a_registry() {
+        // No registry means the `todo` tool is never advertised, so forcing it
+        // would name a tool the request does not carry.
+        assert!(!should_force_goal_todo_plan(true, &None).await);
     }
 
     #[tokio::test]
-    async fn eager_todo_plan_not_suggested_past_the_first_user_turn() {
-        let convo = vec![
-            user_message("build a flappy bird clone"),
-            json!({ "role": "assistant", "content": "on it" }),
-            user_message("also add a high score screen"),
-        ];
-        assert!(!should_suggest_eager_todo_plan(&convo, &None).await);
+    async fn todo_addendum_is_upkeep_only_outside_goal_mode() {
+        let staged = Some(staged_todo_registry());
+        assert_eq!(
+            todo_prompt_addendum(false, &staged).await,
+            Some(TODO_UPKEEP_PROMPT_ADDENDUM)
+        );
+        assert_eq!(
+            todo_prompt_addendum(false, &Some(empty_todo_registry())).await,
+            None
+        );
     }
 
     #[test]
@@ -2120,7 +2189,7 @@ mod tests {
             &tx,
             &json!({}),
             "m",
-            &[],
+            &[crate::core::agent::todo::todo_tool_schema()],
             convo,
             8,
             &mut budget,
@@ -2143,6 +2212,27 @@ mod tests {
         assert_eq!(
             requests[1]["tool_choice"], "auto",
             "later turns must not keep forcing the same tool"
+        );
+    }
+
+    #[test]
+    fn forced_tool_choice_requires_an_advertised_tool() {
+        let messages = vec![json!({ "role": "user", "content": "build a flappy bird clone" })];
+        let ask_only = vec![crate::core::agent::interaction::ask_tool_schema()];
+
+        let ask_request =
+            build_completion_request("m", &messages, &ask_only, &json!({}), Some("todo"));
+        assert_eq!(
+            ask_request["tool_choice"], "auto",
+            "a named tool_choice must not select a tool omitted from tools"
+        );
+
+        let todo = crate::core::agent::todo::todo_tool_schema();
+        let todo_request =
+            build_completion_request("m", &messages, &[todo], &json!({}), Some("todo"));
+        assert_eq!(
+            todo_request["tool_choice"],
+            json!({ "type": "function", "function": { "name": "todo" } })
         );
     }
 
@@ -2501,8 +2591,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_cycle_stops_when_budget_exhausted() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+    async fn turn_cycle_soft_stops_when_budget_exhausted() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let mut over_budget = tool_call_completion();
         over_budget["usage"] = json!({ "total_tokens": 100 });
         let model = MockModel::new(vec![over_budget]);
@@ -2510,7 +2600,7 @@ mod tests {
         let mut budget = SessionBudget::new(Some(50));
         let convo = vec![json!({ "role": "user", "content": "hi" })];
 
-        let err = run_turn_cycle(
+        let result = run_turn_cycle(
             &tx,
             &json!({}),
             "m",
@@ -2525,12 +2615,28 @@ mod tests {
             None,
         )
         .await
-        .unwrap_err();
+        .expect("budget exhaustion is a soft stop, not an error");
 
-        assert!(err.contains("budget"), "unexpected error: {err}");
+        let final_text = extract_choice_message(&result)
+            .and_then(|m| m.get("content").and_then(|c| c.as_str()))
+            .unwrap_or_default();
+        let spent = budget.spent();
+        assert!(
+            final_text.contains("budget")
+                && final_text.contains(&spent.to_string()),
+            "soft stop should describe the exhausted budget ({spent} tokens): {final_text}",
+        );
         assert!(
             tool.calls.lock().unwrap().is_empty(),
             "tool must not run once budget is exhausted"
+        );
+        // A MessagesUpdated is published so live surfaces (and the replay
+        // session) see the partial conversation before the soft stop.
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok()).any(
+                |ev| matches!(ev, StreamEvent::MessagesUpdated { .. })
+            ),
+            "expected a MessagesUpdated event on soft stop"
         );
     }
 
@@ -2587,6 +2693,76 @@ mod tests {
         assert!(tool.calls.lock().unwrap().is_empty());
     }
 
+    /// A run that never recovers from overflow still has to hand its compacted
+    /// conversation to the client: without it the session keeps the oversized
+    /// history and every later turn re-overflows by construction.
+    #[tokio::test]
+    async fn turn_cycle_publishes_compacted_history_before_giving_up() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let overflow = || {
+            Err(format!(
+                "[{}] Upstream returned HTTP 400: context_length_exceeded",
+                crate::core::agent::upstream::CONTEXT_OVERFLOW_MARKER
+            ))
+        };
+        let summary = || Ok(json!({ "choices": [{ "message": { "content": "SUMMARY" } }] }));
+        let model = ResultQueueModel {
+            results: StdMutex::new(
+                vec![
+                    overflow(),
+                    summary(),
+                    overflow(),
+                    summary(),
+                    overflow(),
+                    summary(),
+                    overflow(),
+                    summary(),
+                    overflow(),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        };
+        let tool = MockTool::default();
+        let mut budget = SessionBudget::new(None);
+        let mut convo = vec![json!({ "role": "system", "content": "sys" })];
+        for i in 0..60 {
+            let r = if i % 2 == 0 { "user" } else { "assistant" };
+            convo.push(json!({ "role": r, "content": format!("m{i}") }));
+        }
+        let original_len = convo.len();
+
+        let result = run_turn_cycle(
+            &tx,
+            &json!({}),
+            "m",
+            &[],
+            convo,
+            8,
+            &mut budget,
+            &model,
+            &tool,
+            crate::core::agent::plan::RunMode::Normal,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "a persistent overflow must still fail");
+        drop(tx);
+        let mut published: Option<usize> = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::MessagesUpdated { messages } = ev {
+                published = Some(messages.len());
+            }
+        }
+        let len = published.expect("compaction must publish MessagesUpdated");
+        assert!(
+            len < original_len,
+            "published history must be shorter than the overflowing one ({len} vs {original_len})"
+        );
+    }
+
     #[tokio::test]
     async fn turn_cycle_skips_execution_on_truncated_tool_calls() {
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -2629,6 +2805,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(result["choices"][0]["message"]["content"], "done");
+    }
+
+    #[test]
+    fn absent_turn_cap_is_unbounded() {
+        assert_eq!(body_turn_cap(&json!({})), 0);
+        assert_eq!(body_turn_cap(&json!({ "max_turns": 0 })), 0);
+        assert_eq!(body_turn_cap(&json!({ "max_turns": 3 })), 3);
+    }
+
+    #[test]
+    fn session_budget_treats_zero_and_absent_as_no_ceiling() {
+        assert_eq!(body_session_budget(&json!({})), None);
+        assert_eq!(body_session_budget(&json!({ "max_session_tokens": 0 })), None);
+        assert_eq!(
+            body_session_budget(&json!({ "max_session_tokens": 128_000 })),
+            Some(128_000)
+        );
     }
 
     #[test]
@@ -3003,7 +3196,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ask_waits_for_and_returns_a_structured_response() {
+    async fn ask_waits_for_and_returns_model_readable_response() {
         let root = unique_project_root();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let permissions: PermissionRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -3035,9 +3228,72 @@ mod tests {
         .unwrap();
 
         let out = task.await.unwrap();
-        let result: serde_json::Value = serde_json::from_str(&out[0].content).unwrap();
-        assert_eq!(result[0]["id"], "scope");
-        assert_eq!(result[0]["selected"][0], "Small");
+        assert_eq!(out[0].content, "User response for \"scope\": Small");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn ask_returns_custom_response_as_clear_model_text() {
+        let root = unique_project_root();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let permissions: PermissionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let asks = crate::core::agent::interaction::new_registry();
+        let mut invoker = build_prompting_invoker(root.clone(), tx, permissions);
+        invoker.ask_requests = Some(asks.clone());
+
+        let task = tokio::spawn(async move { invoker.invoke(&[ask_call()]).await.unwrap() });
+        let request_id = match rx.recv().await.unwrap() {
+            StreamEvent::AskRequest { request_id, .. } => request_id,
+            event => panic!("expected ask_request, got {event:?}"),
+        };
+        crate::core::agent::interaction::respond(
+            &asks,
+            &request_id,
+            Ok(vec![crate::core::agent::interaction::QuestionResult {
+                id: "scope".into(),
+                selected: Vec::new(),
+                custom_input: Some("CUSTOM-SENTINEL-4829".into()),
+            }]),
+        )
+        .await
+        .unwrap();
+
+        let out = task.await.unwrap();
+        assert_eq!(
+            out[0].content,
+            "User response for \"scope\": CUSTOM-SENTINEL-4829"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn ask_returns_custom_response_at_invoker_boundary() {
+        let root = unique_project_root();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let permissions: PermissionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let asks = crate::core::agent::interaction::new_registry();
+        let mut invoker = build_prompting_invoker(root.clone(), tx, permissions);
+        invoker.ask_requests = Some(asks.clone());
+
+        let task = tokio::spawn(async move { invoker.invoke(&[ask_call()]).await.unwrap() });
+        let request_id = match rx.recv().await.unwrap() {
+            StreamEvent::AskRequest { request_id, .. } => request_id,
+            event => panic!("expected ask_request, got {event:?}"),
+        };
+        crate::core::agent::interaction::respond(
+            &asks,
+            &request_id,
+            Ok(vec![crate::core::agent::interaction::QuestionResult {
+                id: "scope".into(),
+                selected: Vec::new(),
+                custom_input: Some("custom answer".into()),
+            }]),
+        )
+        .await
+        .unwrap();
+
+        let out = task.await.unwrap();
+        assert_eq!(out[0].content, "User response for \"scope\": custom answer");
         let _ = std::fs::remove_dir_all(&root);
     }
 
